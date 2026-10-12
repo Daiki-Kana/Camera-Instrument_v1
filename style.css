@@ -1,0 +1,96 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: #000000;
+  /* iOS Safariのバウンススクロールやジェスチャーを防止 */
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+#container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100dvh; /* iOS Safariのアドレスバー考慮 */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background-color: #000000;
+  overflow: hidden;
+}
+
+/* 5:3のアスペクト比を維持しつつ、横画面に合わせて画面内に最大表示 */
+#stage {
+  position: relative;
+  aspect-ratio: 5 / 3;
+  width: min(100vw, calc(100dvh * 5 / 3));
+  height: min(100dvh, calc(100vw * 3 / 5));
+  overflow: hidden;
+  background-color: #000000;
+  border: 1px solid rgba(125, 211, 252, 0.35); /* 5:3枠を視覚的に明示 */
+  border-radius: 4px;
+}
+
+/* カメラ映像と描画キャンバスをステージ（5:4）に完全一致させる */
+#webcam,
+#output_canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover; /* 歪みを防ぎ、5:4画角に美しくフィット */
+  transform: scaleX(-1); /* 鏡像表示（前面カメラ） */
+}
+
+/* 描画キャンバスをカメラ映像の前面に配置 */
+#output_canvas {
+  pointer-events: none;
+}
+
+/* 起動時・待機時のみ画面中央に薄く表示するステータス（起動完了で消去） */
+#status-message {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: rgba(255, 255, 255, 0.7);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  text-align: center;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+  z-index: 10;
+}
+
+#status-message.hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* 画面右上に薄く小さく表示する解像度・FPSバッジ */
+#info-badge {
+  position: absolute;
+  top: max(env(safe-area-inset-top), 8px);
+  right: max(env(safe-area-inset-right), 8px);
+  padding: 3px 6px;
+  background-color: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.7);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 20;
+}
