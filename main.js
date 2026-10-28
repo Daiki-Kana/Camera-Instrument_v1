@@ -1,7 +1,9 @@
 import {
-  PoseLandmarker,
+  HandLandmarker,
   FilesetResolver
 } from '@mediapipe/tasks-vision';
+import { ClapDetector, CLOSE_THRESHOLD } from './clap-detector.js';
+import { SoundPlayer } from './sound-player.js';
 
 const video = document.getElementById('webcam');
 const canvas = document.getElementById('output_canvas');
@@ -10,7 +12,7 @@ const statusMessage = document.getElementById('status-message');
 const infoBadge = document.getElementById('info-badge');
 const container = document.getElementById('container');
 
-let poseLandmarker = null;
+let handLandmarker = null;
 let lastVideoTime = -1;
 let isPredicting = false;
 
@@ -35,48 +37,41 @@ function hideStatus() {
   }
 }
 
-// MediaPipe PoseLandmarkerの初期化
-async function initPoseLandmarker() {
-  setStatus('骨格認識モデルを読み込み中...');
+const WASM_PATH = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const HAND_MODEL_PATH =
+  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+const HAND_OPTIONS = {
+  runningMode: 'VIDEO',
+  numHands: 2, // 演奏者の両手
+  minHandDetectionConfidence: 0.5,
+  // 手が重なって隠れかけても追跡を続けられるよう、追跡側の信頼度は低めに設定
+  minHandPresenceConfidence: 0.3,
+  minTrackingConfidence: 0.3
+};
+
+// MediaPipe HandLandmarker（手のひら・拍手判定）の初期化
+async function initHandLandmarker() {
+  setStatus('手の認識モデルを読み込み中...');
 
   try {
-    const vision = await FilesetResolver.forVisionTasks(
-      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-    );
-
-    // モバイル向けに軽量な pose_landmarker_lite を使用
-    poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-        delegate: 'GPU' // GPUアクセラレーション（WebGL）
-      },
-      runningMode: 'VIDEO',
-      numPoses: 1, // 認識対象人数（必要に応じて複数人対応可能）
-      minPoseDetectionConfidence: 0.5,
-      minPosePresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5
-    });
-  } catch (error) {
-    console.warn('GPUでの初期化に失敗したため、CPUにフォールバックします:', error);
+    const vision = await FilesetResolver.forVisionTasks(WASM_PATH);
     try {
-      const vision = await FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-      );
-      poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-          delegate: 'CPU'
-        },
-        runningMode: 'VIDEO',
-        numPoses: 1
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: HAND_MODEL_PATH, delegate: 'GPU' }, // GPUアクセラレーション（WebGL）
+        ...HAND_OPTIONS
       });
-    } catch (fallbackError) {
-      console.error('PoseLandmarkerの読み込みに失敗しました:', fallbackError);
-      setStatus('モデルの読み込みに失敗しました', true);
-      throw fallbackError;
+    } catch (error) {
+      console.warn('GPUでの初期化に失敗したため、CPUにフォールバックします:', error);
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: HAND_MODEL_PATH, delegate: 'CPU' },
+        ...HAND_OPTIONS
+      });
     }
+  } catch (error) {
+    console.error('HandLandmarkerの読み込みに失敗しました:', error);
+    setStatus('モデルの読み込みに失敗しました', true);
+    throw error;
   }
 }
 
@@ -102,10 +97,8 @@ async function startCamera(facingMode = 'user') {
     tracks.forEach((track) => track.stop());
   }
 
-  // カメラ切り替え時にフィルターの過去履歴をリセット
-  if (typeof landmarkSmoother !== 'undefined' && landmarkSmoother) {
-    landmarkSmoother.reset();
-  }
+  // カメラ切り替え時に拍手判定の履歴をリセット
+  clapDetector.reset();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setStatus('お使いのブラウザはカメラアクセスに対応していません（HTTPS接続が必要です）', true);
@@ -174,259 +167,205 @@ async function startCamera(facingMode = 'user') {
   }
 }
 
-// 表示対象とする体の代表部位（顔の細部や指先は除外）
-const KEY_LANDMARKS = [
-  0,  // 頭部（鼻）
-  11, // 左肩
-  12, // 右肩
-  13, // 左肘
-  14, // 右肘
-  15, // 左手首
-  16, // 右手首
-  23, // 左腰
-  24, // 右腰
-  25, // 左膝
-  26, // 右膝
-  27, // 左足首
-  28  // 右足首
+// 拍手時に鳴らす音色（public/sounds/ に配置、画面下のスイッチで切り替え）
+// scripts/generate-sounds.mjs で生成
+// 他の音: kick / snare / woodblock / pluck / zap（.wav）
+const SOUNDS = [
+  { id: 'crash', label: 'シンバル', file: 'sounds/crash.wav' },
+  { id: 'tambourine', label: 'タンバリン', file: 'sounds/tambourine.wav' },
+  { id: 'hihat', label: 'ハイハット', file: 'sounds/hihat.wav' },
+  { id: 'clap', label: 'クラップ', file: 'sounds/clap.wav' },
+  { id: 'bell', label: 'ベル', file: 'sounds/bell.wav' }
 ];
+const SOUND_STORAGE_KEY = 'camera-instrument:sound';
 
-// 代表部位をつなぐ骨格ライン（接続ペア）
-const SKELETON_CONNECTIONS = [
-  // 肩
-  [11, 12],
-  // 左腕
-  [11, 13],
-  [13, 15],
-  // 右腕
-  [12, 14],
-  [14, 16],
-  // 胴体
-  [11, 23],
-  [12, 24],
-  [23, 24],
-  // 左脚
-  [23, 25],
-  [25, 27],
-  // 右脚
-  [24, 26],
-  [26, 28]
-];
+const clapDetector = new ClapDetector();
+const soundPlayer = new SoundPlayer(
+  SOUNDS.map(({ id, file }) => ({ id, url: import.meta.env.BASE_URL + file }))
+);
 
-// 代表骨格と関節の描画
-function drawSimplifiedSkeleton(landmarks, width, height) {
-  canvasCtx.save();
+// 画面下の音色スイッチ（選択は次回起動時も保持）
+function setupSoundSwitch() {
+  const bar = document.getElementById('sound-switch');
+  if (!bar) return;
 
-  // 1. 骨格ラインの描画（薄い水色）
-  canvasCtx.strokeStyle = 'rgba(125, 211, 252, 0.85)'; // 淡い水色
-  canvasCtx.lineWidth = 6.5; // 線幅を太めに設定
-  canvasCtx.lineCap = 'round';
-  canvasCtx.lineJoin = 'round';
-
-  // 首ライン（頭部と両肩の中間点を接続）
-  const nose = landmarks[0];
-  const lShoulder = landmarks[11];
-  const rShoulder = landmarks[12];
-  if (nose && lShoulder && rShoulder) {
-    const neckX = ((lShoulder.x + rShoulder.x) / 2) * width;
-    const neckY = ((lShoulder.y + rShoulder.y) / 2) * height;
-    canvasCtx.beginPath();
-    canvasCtx.moveTo(nose.x * width, nose.y * height);
-    canvasCtx.lineTo(neckX, neckY);
-    canvasCtx.stroke();
+  let savedId = null;
+  try {
+    savedId = localStorage.getItem(SOUND_STORAGE_KEY);
+  } catch {
+    // ストレージが使えない環境では保持しない
+  }
+  if (SOUNDS.some((s) => s.id === savedId)) {
+    soundPlayer.select(savedId);
   }
 
-  // 主要骨格ライン
-  for (const [startIdx, endIdx] of SKELETON_CONNECTIONS) {
-    const p1 = landmarks[startIdx];
-    const p2 = landmarks[endIdx];
-    if (p1 && p2) {
+  const buttons = SOUNDS.map((sound) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = sound.label;
+    button.addEventListener('click', (event) => {
+      // 画面タップ（ダブルタップでのカメラ切り替え）と区別する
+      event.stopPropagation();
+      soundPlayer.select(sound.id);
+      try {
+        localStorage.setItem(SOUND_STORAGE_KEY, sound.id);
+      } catch {
+        // ストレージが使えない環境では保持しない
+      }
+      updateActive();
+      // 選んだ音色を試し鳴らし（このタップで音声も有効化される）
+      soundPlayer.unlock().then(() => soundPlayer.play(0.7)).catch(console.error);
+    });
+    bar.appendChild(button);
+    return { id: sound.id, button };
+  });
+
+  function updateActive() {
+    for (const { id, button } of buttons) {
+      button.classList.toggle('active', id === soundPlayer.currentId);
+    }
+  }
+  updateActive();
+}
+let clapCount = 0;
+let lastClapEffect = null; // 拍手位置に表示する波紋エフェクト
+
+const CLAP_EFFECT_MS = 300;
+
+// 手の骨格・手のひら中心・拍手判定状態の描画
+function drawHands(handLandmarks, clapState, width, height) {
+  canvasCtx.save();
+
+  // 1. 手の骨格（認識できている手の形を薄く表示）
+  canvasCtx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+  canvasCtx.lineWidth = 2;
+  canvasCtx.lineCap = 'round';
+  for (const landmarks of handLandmarks) {
+    for (const { start, end } of HandLandmarker.HAND_CONNECTIONS) {
       canvasCtx.beginPath();
-      canvasCtx.moveTo(p1.x * width, p1.y * height);
-      canvasCtx.lineTo(p2.x * width, p2.y * height);
+      canvasCtx.moveTo(landmarks[start].x * width, landmarks[start].y * height);
+      canvasCtx.lineTo(landmarks[end].x * width, landmarks[end].y * height);
       canvasCtx.stroke();
     }
   }
 
-  // 2. 代表部位の関節点（淡い水色ドット）
-  canvasCtx.fillStyle = 'rgba(186, 230, 253, 0.95)';
-  for (const idx of KEY_LANDMARKS) {
-    const pt = landmarks[idx];
-    if (pt) {
+  const { palms, ratio, isArmed } = clapState;
+
+  // 2. 両手のひらを結ぶ線（黄色: 拍手受付中 / 灰色: 一度手を開くまで待機中）
+  if (palms.length >= 2) {
+    const [a, b] = palms;
+    canvasCtx.strokeStyle = isArmed ? 'rgba(250, 204, 21, 0.9)' : 'rgba(156, 163, 175, 0.7)';
+    canvasCtx.lineWidth = 3;
+    canvasCtx.setLineDash([6, 6]);
+    canvasCtx.beginPath();
+    canvasCtx.moveTo(a.x * width, a.y * height);
+    canvasCtx.lineTo(b.x * width, b.y * height);
+    canvasCtx.stroke();
+    canvasCtx.setLineDash([]);
+  }
+
+  // 3. 手のひらの中心と判定範囲（2つの輪が触れると拍手と判定される）
+  const isClose = ratio !== null && ratio < CLOSE_THRESHOLD;
+  for (const palm of palms) {
+    const cx = palm.x * width;
+    const cy = palm.y * height;
+
+    canvasCtx.strokeStyle = isClose ? 'rgba(244, 114, 182, 0.95)' : 'rgba(244, 114, 182, 0.5)';
+    canvasCtx.lineWidth = 2;
+    canvasCtx.beginPath();
+    canvasCtx.arc(cx, cy, (CLOSE_THRESHOLD * palm.size * height) / 2, 0, Math.PI * 2);
+    canvasCtx.stroke();
+
+    canvasCtx.fillStyle = 'rgba(244, 114, 182, 1)';
+    canvasCtx.beginPath();
+    canvasCtx.arc(cx, cy, 6, 0, Math.PI * 2);
+    canvasCtx.fill();
+  }
+
+  // 4. 拍手した位置に広がる波紋
+  if (lastClapEffect) {
+    const progress = (performance.now() - lastClapEffect.shownAt) / CLAP_EFFECT_MS;
+    if (progress < 1) {
+      canvasCtx.strokeStyle = `rgba(250, 204, 21, ${1 - progress})`;
+      canvasCtx.lineWidth = 5;
       canvasCtx.beginPath();
-      canvasCtx.arc(pt.x * width, pt.y * height, 6.0, 0, Math.PI * 2);
-      canvasCtx.fill();
+      canvasCtx.arc(lastClapEffect.x * width, lastClapEffect.y * height, 15 + progress * 60, 0, Math.PI * 2);
+      canvasCtx.stroke();
+    } else {
+      lastClapEffect = null;
     }
   }
 
   canvasCtx.restore();
 }
 
-// --- One Euro Filter（適応型平滑化フィルター）の実装 ---
-// 静止時は手ブレ・微細な震えを除去し、高速運動時は遅延ゼロで即追従するフィルター
-class LowPassFilter {
-  constructor(alpha = 0) {
-    this.alpha = alpha;
-    this.s = null;
+// 表示用キャンバスの内部解像度（5:3）
+const DISPLAY_WIDTH = 500;
+const DISPLAY_HEIGHT = 300;
+const TARGET_ASPECT = 5 / 3;
+
+// 推論にかかった時間（ms、表示用に平滑化）
+let inferenceMs = 0;
+
+// 画面に表示されるカメラ映像の中央5:3領域（object-fit: cover と同じ切り出し）
+function getCropRect() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (vw / vh > TARGET_ASPECT) {
+    // 元映像が横長の場合、左右を均等にトリミング
+    const w = vh * TARGET_ASPECT;
+    return { x: (vw - w) / 2 / vw, y: 0, w: w / vw, h: 1 };
   }
-  setAlpha(alpha) {
-    this.alpha = Math.max(0, Math.min(1, alpha));
-  }
-  filter(val) {
-    if (this.s === null) {
-      this.s = val;
-    } else {
-      this.s = this.alpha * val + (1 - this.alpha) * this.s;
-    }
-    return this.s;
-  }
-  last() { return this.s; }
-  reset() { this.s = null; }
+  // 元映像が縦長の場合、上下を均等にトリミング
+  const h = vw / TARGET_ASPECT;
+  return { x: 0, y: (vh - h) / 2 / vh, w: 1, h: h / vh };
 }
 
-class OneEuroFilter {
-  constructor(minCutoff = 1.0, beta = 0.008, dCutoff = 1.0) {
-    this.minCutoff = minCutoff; // 静止時の遮断周波数（小さいほどブレを強力にカット）
-    this.beta = beta;           // 速度感度係数（大きいほど高速時の追従遅延を削減）
-    this.dCutoff = dCutoff;     // 速度の遮断周波数
-    this.xFilter = new LowPassFilter();
-    this.dxFilter = new LowPassFilter();
-    this.tPrev = null;
-  }
+// カメラ映像全体の正規化座標を、5:3表示領域の正規化座標に変換
+function toDisplayCoords(handLandmarks, crop) {
+  return handLandmarks.map((landmarks) =>
+    landmarks.map((lm) => ({ ...lm, x: (lm.x - crop.x) / crop.w, y: (lm.y - crop.y) / crop.h }))
+  );
+}
 
-  alpha(cutoff, te) {
-    const tau = 1.0 / (2 * Math.PI * cutoff);
-    return 1.0 / (1.0 + tau / te);
-  }
-
-  filter(val, timestamp) {
-    if (this.tPrev === null) {
-      this.tPrev = timestamp;
-      return this.xFilter.filter(val);
-    }
-    const te = Math.max((timestamp - this.tPrev) / 1000.0, 0.0001); // 経過秒数
-    this.tPrev = timestamp;
-
-    const prevX = this.xFilter.last();
-    const dx = (prevX !== null) ? (val - prevX) / te : 0;
-    const edx = this.dxFilter.filter(dx);
-    this.dxFilter.setAlpha(this.alpha(this.dCutoff, te));
-
-    const cutoff = this.minCutoff + this.beta * Math.abs(edx);
-    this.xFilter.setAlpha(this.alpha(cutoff, te));
-
-    return this.xFilter.filter(val);
-  }
-
-  reset() {
-    this.xFilter.reset();
-    this.dxFilter.reset();
-    this.tPrev = null;
+// カメラの新しいフレームが届いた直後に処理する（未対応ブラウザは画面描画ごと）
+function scheduleNextFrame() {
+  if ('requestVideoFrameCallback' in video) {
+    video.requestVideoFrameCallback(renderLoop);
+  } else {
+    requestAnimationFrame(renderLoop);
   }
 }
 
-// 主要ランドマークの座標平滑化管理
-class LandmarkSmoother {
-  constructor() {
-    this.filters = new Map();
-    this.lastTimestamp = 0;
-  }
-
-  smooth(landmarks, timestamp) {
-    // 0.3秒以上検出が途切れた場合は古い履歴をリセット
-    if (timestamp - this.lastTimestamp > 300) {
-      this.reset();
-    }
-    this.lastTimestamp = timestamp;
-
-    return landmarks.map((lm, idx) => {
-      if (!KEY_LANDMARKS.includes(idx)) return lm;
-
-      const keyX = `${idx}_x`;
-      const keyY = `${idx}_y`;
-
-      if (!this.filters.has(keyX)) {
-        this.filters.set(keyX, new OneEuroFilter(1.0, 0.008, 1.0));
-        this.filters.set(keyY, new OneEuroFilter(1.0, 0.008, 1.0));
-      }
-
-      const smoothedX = this.filters.get(keyX).filter(lm.x, timestamp);
-      const smoothedY = this.filters.get(keyY).filter(lm.y, timestamp);
-
-      return {
-        ...lm,
-        x: smoothedX,
-        y: smoothedY
-      };
-    });
-  }
-
-  reset() {
-    this.filters.forEach((filter) => filter.reset());
-    this.filters.clear();
-  }
-}
-
-const landmarkSmoother = new LandmarkSmoother();
-
-// AI推論・処理用の5:3オフスクリーンキャンバス（低解像度・高速化）
-const PROCESS_WIDTH = 500;
-const PROCESS_HEIGHT = 300; // 5:3比率
-const processCanvas = document.createElement('canvas');
-processCanvas.width = PROCESS_WIDTH;
-processCanvas.height = PROCESS_HEIGHT;
-const processCtx = processCanvas.getContext('2d', { willReadFrequently: true });
-
-// 骨格推定のリアルタイム描画ループ
+// 手の認識・拍手判定のリアルタイム描画ループ
 function renderLoop() {
-  if (video.readyState >= 2 && poseLandmarker) {
+  if (video.readyState >= 2 && handLandmarker) {
     // 表示用キャンバスの内部解像度を5:3（500x300）に固定
-    if (canvas.width !== PROCESS_WIDTH || canvas.height !== PROCESS_HEIGHT) {
-      canvas.width = PROCESS_WIDTH;
-      canvas.height = PROCESS_HEIGHT;
+    if (canvas.width !== DISPLAY_WIDTH || canvas.height !== DISPLAY_HEIGHT) {
+      canvas.width = DISPLAY_WIDTH;
+      canvas.height = DISPLAY_HEIGHT;
     }
 
     if (video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;
 
-      // カメラ映像の中央5:3領域を切り出してオフスクリーンCanvasに縮小描画
-      const srcAspect = video.videoWidth / video.videoHeight;
-      const targetAspect = 5 / 3; // 約1.67
-
-      let sx = 0, sy = 0, sWidth = video.videoWidth, sHeight = video.videoHeight;
-      if (srcAspect > targetAspect) {
-        // 元映像が横長の場合、左右を均等にトリミングして中央の5:3を切り出す
-        sWidth = video.videoHeight * targetAspect;
-        sx = (video.videoWidth - sWidth) / 2;
-      } else {
-        // 元映像が縦長の場合、上下を均等にトリミング
-        sHeight = video.videoWidth / targetAspect;
-        sy = (video.videoHeight - sHeight) / 2;
-      }
-
-      processCtx.drawImage(
-        video,
-        sx, sy, sWidth, sHeight,
-        0, 0, PROCESS_WIDTH, PROCESS_HEIGHT
-      );
-
-      // 軽量化された5:3画像（500x300）から骨格を検出
+      // カメラ映像をコピーせず直接渡して検出（キャンバス経由のGPU⇔CPU転送を省いて高速化）
       const startTimeMs = performance.now();
-      const results = poseLandmarker.detectForVideo(processCanvas, startTimeMs);
+      const handResults = handLandmarker.detectForVideo(video, startTimeMs);
+      inferenceMs = inferenceMs * 0.9 + (performance.now() - startTimeMs) * 0.1;
 
       // 前フレームの描画をクリア
       canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
 
-      if (results && results.landmarks && results.landmarks.length > 0) {
-        for (const landmarks of results.landmarks) {
-          // One Euro Filterで平滑化（ブレを抑制しつつ遅延なしで追従）
-          const smoothedLandmarks = landmarkSmoother.smooth(landmarks, startTimeMs);
-          // 5:3の表示キャンバス上に骨格を描画（ビデオ映像と完全一致）
-          drawSimplifiedSkeleton(smoothedLandmarks, canvas.width, canvas.height);
-        }
-      } else {
-        landmarkSmoother.reset();
+      // 両手のひらの距離から拍手を判定
+      const handLandmarks = toDisplayCoords(handResults?.landmarks ?? [], getCropRect());
+      const clapState = clapDetector.update(handLandmarks, startTimeMs);
+      if (clapState.clap) {
+        clapCount++;
+        soundPlayer.play(clapState.clap.strength);
+        lastClapEffect = { ...clapState.clap, shownAt: performance.now() };
       }
+      drawHands(handLandmarks, clapState, canvas.width, canvas.height);
 
       // 最初の描画が成功したらステータス表示を消す
       if (!isPredicting) {
@@ -434,26 +373,36 @@ function renderLoop() {
         hideStatus();
       }
 
-      // 実際の解像度とFPSを更新（0.5秒間隔でリフレッシュ）
+      // FPSを0.5秒間隔で計測
       frameCount++;
       const now = performance.now();
       if (now - lastFpsUpdate >= 500) {
         currentFps = Math.round((frameCount * 1000) / (now - lastFpsUpdate));
         frameCount = 0;
         lastFpsUpdate = now;
-        if (infoBadge) {
-          infoBadge.textContent = `5:3 (${PROCESS_WIDTH}×${PROCESS_HEIGHT}) ${currentFps}fps`;
-        }
+      }
+
+      // 処理FPS（カメラFPS）・推論時間・検出した手の数・両手のひらの距離（閾値調整用）を毎フレーム表示
+      if (infoBadge) {
+        const cameraFps = Math.round(video.srcObject?.getVideoTracks()[0]?.getSettings().frameRate ?? 0);
+        const ratioText = clapState.ratio !== null ? clapState.ratio.toFixed(2) : '--';
+        const soundState = soundPlayer.isUnlocked ? '' : ' 🔇タップで音ON';
+        infoBadge.textContent =
+          `${currentFps}fps(cam${cameraFps}) 推論${Math.round(inferenceMs)}ms ` +
+          `手:${clapState.palms.length} 距離:${ratioText} 拍手:${clapCount}${soundState}`;
       }
     }
   }
 
-  requestAnimationFrame(renderLoop);
+  scheduleNextFrame();
 }
 
 // iOS Safariで自動再生がブロックされた場合の画面タップ復帰
 let lastTapTime = 0;
 container.addEventListener('click', () => {
+  // 最初のタップで音声再生を有効化
+  soundPlayer.unlock().catch(console.error);
+
   const now = Date.now();
   // ダブルタップ検知（300ms以内）で前面/背面カメラを切り替え
   if (now - lastTapTime < 300) {
@@ -474,10 +423,18 @@ container.addEventListener('click', () => {
 
 // アプリの起動処理
 async function init() {
+  setupSoundSwitch();
   try {
-    // モデル読み込みとカメラ起動を並列で実行し、起動時間を短縮
-    await Promise.all([initPoseLandmarker(), startCamera()]);
-    requestAnimationFrame(renderLoop);
+    // モデル読み込み・カメラ起動・音声読み込みを並列で実行し、起動時間を短縮
+    const [, , loadedSounds] = await Promise.all([
+      initHandLandmarker(),
+      startCamera(),
+      soundPlayer.load()
+    ]);
+    if (loadedSounds === 0) {
+      console.warn('再生できる音声ファイルがありません。public/sounds/ に配置してください');
+    }
+    scheduleNextFrame();
   } catch (err) {
     console.error('アプリの初期化中にエラーが発生しました:', err);
   }
