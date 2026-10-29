@@ -2,15 +2,20 @@ import {
   HandLandmarker,
   FilesetResolver
 } from '@mediapipe/tasks-vision';
-import { ClapDetector, CLOSE_THRESHOLD } from './clap-detector.js';
+import { ClapDetector, CLOSE_THRESHOLD, DEFAULT_LEAD_MS } from './clap-detector.js';
 import { SoundPlayer } from './sound-player.js';
 
 const video = document.getElementById('webcam');
 const canvas = document.getElementById('output_canvas');
 const canvasCtx = canvas.getContext('2d');
 const statusMessage = document.getElementById('status-message');
-const infoBadge = document.getElementById('info-badge');
+const audioHint = document.getElementById('audio-hint');
 const container = document.getElementById('container');
+
+// 設定パネル内の計測値の表示先（data-stat 属性で対応付け）
+const statElements = Object.fromEntries(
+  [...document.querySelectorAll('[data-stat]')].map((el) => [el.dataset.stat, el])
+);
 
 let handLandmarker = null;
 let lastVideoTime = -1;
@@ -108,19 +113,31 @@ async function startCamera(facingMode = 'user') {
   setStatus('カメラを起動中...');
 
   // 5:3アスペクト比・60fps駆動・低解像度を要求
+  // カメラの向きは exact で指定する（ideal だと、60fpsを満たせる別のカメラが選ばれてしまうため）
   const constraintsList = [
     // 試行1: 60fps固定（min: 55, ideal: 60）、5:3比率要求、最大640x480
     {
       audio: false,
       video: {
-        facingMode: facingMode,
+        facingMode: { exact: facingMode },
         width: { max: 640 },
         height: { max: 480 },
         aspectRatio: { ideal: 5 / 3 },
         frameRate: { min: 55, ideal: 60 }
       }
     },
-    // 試行2: 60fps優先（min制約緩和）、5:3比率要求
+    // 試行2: fps制約を緩和（内カメラは30fpsまでの機種が多い）
+    {
+      audio: false,
+      video: {
+        facingMode: { exact: facingMode },
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+        aspectRatio: { ideal: 5 / 3 },
+        frameRate: { ideal: 60 }
+      }
+    },
+    // 試行3: カメラの向きを指定できない環境（PCのWebカメラなど）
     {
       audio: false,
       video: {
@@ -128,7 +145,7 @@ async function startCamera(facingMode = 'user') {
         width: { ideal: 640 },
         height: { ideal: 480 },
         aspectRatio: { ideal: 5 / 3 },
-        frameRate: { ideal: 60, min: 30 }
+        frameRate: { ideal: 60 }
       }
     }
   ];
@@ -184,6 +201,82 @@ const soundPlayer = new SoundPlayer(
   SOUNDS.map(({ id, file }) => ({ id, url: import.meta.env.BASE_URL + file }))
 );
 
+const LEAD_STORAGE_KEY = 'camera-instrument:lead-ms';
+
+// 設定パネル内の先読みスライダー（叩いた瞬間と音のずれを耳で合わせる。値は次回起動時も保持）
+function setupLeadSlider() {
+  const slider = document.getElementById('lead-slider');
+  const label = document.getElementById('lead-value');
+  if (!slider || !label) return;
+
+  let leadMs = DEFAULT_LEAD_MS;
+  try {
+    const saved = Number(localStorage.getItem(LEAD_STORAGE_KEY));
+    if (localStorage.getItem(LEAD_STORAGE_KEY) !== null && Number.isFinite(saved)) leadMs = saved;
+  } catch {
+    // ストレージが使えない環境では保持しない
+  }
+
+  const apply = (ms) => {
+    clapDetector.setLeadMs(ms);
+    slider.value = String(ms);
+    label.textContent = `${ms}ms`;
+  };
+  apply(leadMs);
+
+  slider.addEventListener('input', () => {
+    const ms = Number(slider.value);
+    apply(ms);
+    try {
+      localStorage.setItem(LEAD_STORAGE_KEY, String(ms));
+    } catch {
+      // ストレージが使えない環境では保持しない
+    }
+  });
+}
+
+// 右上の設定ボタン（先読み調整・カメラ切り替え・計測値を格納したパネルを開閉）
+function setupSettingsPanel() {
+  const toggle = document.getElementById('settings-toggle');
+  const panel = document.getElementById('settings-panel');
+  const cameraSwitch = document.getElementById('camera-switch');
+  if (!toggle || !panel) return;
+
+  toggle.addEventListener('click', () => {
+    const isOpen = panel.hidden;
+    panel.hidden = !isOpen;
+    toggle.setAttribute('aria-expanded', String(isOpen));
+  });
+
+  cameraSwitch?.addEventListener('click', () => {
+    startCamera(currentFacingMode === 'user' ? 'environment' : 'user');
+  });
+}
+
+// 設定パネルの計測値表示を更新（パネルが閉じている間は更新しない）
+function updateStats(clapState) {
+  const panel = document.getElementById('settings-panel');
+  if (!panel || panel.hidden) return;
+
+  const cameraFps = Math.round(video.srcObject?.getVideoTracks()[0]?.getSettings().frameRate ?? 0);
+  // 音の出力遅延（再生命令〜スピーカーから音が出るまで）
+  const audioMs = Math.round(
+    ((soundPlayer.ctx.baseLatency ?? 0) + (soundPlayer.ctx.outputLatency ?? 0)) * 1000
+  );
+  const values = {
+    fps: `${currentFps} / ${cameraFps}`,
+    inference: `${Math.round(inferenceMs)}ms`,
+    output: `${audioMs}ms`,
+    hands: String(clapState.palms.length),
+    ratio: clapState.ratio !== null ? clapState.ratio.toFixed(2) : '--',
+    claps: String(clapCount)
+  };
+  for (const [key, value] of Object.entries(values)) {
+    const el = statElements[key];
+    if (el && el.textContent !== value) el.textContent = value;
+  }
+}
+
 // 画面下の音色スイッチ（選択は次回起動時も保持）
 function setupSoundSwitch() {
   const bar = document.getElementById('sound-switch');
@@ -203,9 +296,7 @@ function setupSoundSwitch() {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = sound.label;
-    button.addEventListener('click', (event) => {
-      // 画面タップ（ダブルタップでのカメラ切り替え）と区別する
-      event.stopPropagation();
+    button.addEventListener('click', () => {
       soundPlayer.select(sound.id);
       try {
         localStorage.setItem(SOUND_STORAGE_KEY, sound.id);
@@ -382,36 +473,18 @@ function renderLoop() {
         lastFpsUpdate = now;
       }
 
-      // 処理FPS（カメラFPS）・推論時間・検出した手の数・両手のひらの距離（閾値調整用）を毎フレーム表示
-      if (infoBadge) {
-        const cameraFps = Math.round(video.srcObject?.getVideoTracks()[0]?.getSettings().frameRate ?? 0);
-        const ratioText = clapState.ratio !== null ? clapState.ratio.toFixed(2) : '--';
-        const soundState = soundPlayer.isUnlocked ? '' : ' 🔇タップで音ON';
-        infoBadge.textContent =
-          `${currentFps}fps(cam${cameraFps}) 推論${Math.round(inferenceMs)}ms ` +
-          `手:${clapState.palms.length} 距離:${ratioText} 拍手:${clapCount}${soundState}`;
-      }
+      // 音声が無効な間だけ「タップして音を有効にする」を表示
+      audioHint?.classList.toggle('hidden', soundPlayer.isUnlocked);
+      updateStats(clapState);
     }
   }
 
   scheduleNextFrame();
 }
 
-// iOS Safariで自動再生がブロックされた場合の画面タップ復帰
-let lastTapTime = 0;
+// 画面タップで音声を有効化し、自動再生がブロックされた場合はカメラ映像を再開
 container.addEventListener('click', () => {
-  // 最初のタップで音声再生を有効化
   soundPlayer.unlock().catch(console.error);
-
-  const now = Date.now();
-  // ダブルタップ検知（300ms以内）で前面/背面カメラを切り替え
-  if (now - lastTapTime < 300) {
-    const nextMode = currentFacingMode === 'user' ? 'environment' : 'user';
-    startCamera(nextMode);
-    lastTapTime = 0;
-    return;
-  }
-  lastTapTime = now;
 
   // 再生が停止している場合は再開
   if (video.paused) {
@@ -424,6 +497,8 @@ container.addEventListener('click', () => {
 // アプリの起動処理
 async function init() {
   setupSoundSwitch();
+  setupLeadSlider();
+  setupSettingsPanel();
   try {
     // モデル読み込み・カメラ起動・音声読み込みを並列で実行し、起動時間を短縮
     const [, , loadedSounds] = await Promise.all([

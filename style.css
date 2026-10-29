@@ -1,3 +1,13 @@
+:root {
+  --accent: #f472b6;
+  --text: rgba(255, 255, 255, 0.92);
+  --text-muted: rgba(255, 255, 255, 0.6);
+  --glass-bg: rgba(20, 20, 24, 0.55);
+  --glass-border: rgba(255, 255, 255, 0.12);
+  --gutter: 12px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans", sans-serif;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -5,6 +15,7 @@
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 html, body {
@@ -12,6 +23,8 @@ html, body {
   height: 100%;
   overflow: hidden;
   background-color: #000000;
+  color: var(--text);
+  font-family: var(--font);
   /* iOS Safariのバウンススクロールやジェスチャーを防止 */
   overscroll-behavior: none;
   touch-action: none;
@@ -30,7 +43,7 @@ html, body {
   overflow: hidden;
 }
 
-/* 5:3のアスペクト比を維持しつつ、横画面に合わせて画面内に最大表示 */
+/* 5:3のアスペクト比を維持しつつ、画面内に最大表示 */
 #stage {
   position: relative;
   aspect-ratio: 5 / 3;
@@ -38,11 +51,9 @@ html, body {
   height: min(100dvh, calc(100vw * 3 / 5));
   overflow: hidden;
   background-color: #000000;
-  border: 1px solid rgba(125, 211, 252, 0.35); /* 5:3枠を視覚的に明示 */
-  border-radius: 4px;
 }
 
-/* カメラ映像と描画キャンバスをステージ（5:4）に完全一致させる */
+/* カメラ映像と描画キャンバスをステージ（5:3）に完全一致させる */
 #webcam,
 #output_canvas {
   position: absolute;
@@ -50,7 +61,7 @@ html, body {
   left: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover; /* 歪みを防ぎ、5:4画角に美しくフィット */
+  object-fit: cover; /* 歪みを防ぎ、5:3画角にフィット */
   transform: scaleX(-1); /* 鏡像表示（前面カメラ） */
 }
 
@@ -59,14 +70,21 @@ html, body {
   pointer-events: none;
 }
 
+/* 半透明のすりガラス風パネル（各UI共通） */
+.glass {
+  background-color: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
 /* 起動時・待機時のみ画面中央に薄く表示するステータス（起動完了で消去） */
 #status-message {
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  color: rgba(255, 255, 255, 0.7);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--text-muted);
   font-size: 14px;
   letter-spacing: 0.05em;
   text-align: center;
@@ -80,46 +98,156 @@ html, body {
   visibility: hidden;
 }
 
-/* 画面下中央の音色切り替えスイッチ */
-#sound-switch {
+/* 音声が無効な間だけ上部中央に表示する案内 */
+#audio-hint {
   position: absolute;
-  bottom: max(env(safe-area-inset-bottom), 10px);
+  top: max(env(safe-area-inset-top), var(--gutter));
   left: 50%;
   transform: translateX(-50%);
-  display: flex;
-  gap: 6px;
+  padding: 7px 14px;
+  border-color: rgba(244, 114, 182, 0.6);
+  border-radius: 999px;
+  font-size: 13px;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
   z-index: 20;
 }
 
-#sound-switch button {
-  padding: 6px 12px;
-  background-color: rgba(0, 0, 0, 0.5);
-  color: rgba(255, 255, 255, 0.8);
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 999px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+#audio-hint.hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* 右上の設定ボタン */
+#settings-toggle {
+  position: absolute;
+  top: max(env(safe-area-inset-top), var(--gutter));
+  right: max(env(safe-area-inset-right), var(--gutter));
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  color: var(--text);
+  border-radius: 50%;
+  cursor: pointer;
+  z-index: 30;
+}
+
+#settings-toggle[aria-expanded="true"] {
+  color: var(--accent);
+  border-color: rgba(244, 114, 182, 0.6);
+}
+
+/* 設定パネル（設定ボタンの下に開く） */
+#settings-panel {
+  position: absolute;
+  top: calc(max(env(safe-area-inset-top), var(--gutter)) + 48px);
+  right: max(env(safe-area-inset-right), var(--gutter));
+  width: min(260px, calc(100vw - var(--gutter) * 2));
+  max-height: calc(100dvh - 120px);
+  overflow-y: auto;
+  padding: 14px;
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   font-size: 13px;
-  white-space: nowrap;
+  z-index: 30;
+}
+
+#settings-panel[hidden] {
+  display: none;
+}
+
+.panel-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.panel-value {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-note {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+#lead-slider {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+#camera-switch {
+  margin-top: 4px;
+  padding: 8px 12px;
+  background-color: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  font: inherit;
   cursor: pointer;
 }
 
-#sound-switch button.active {
-  background-color: rgba(244, 114, 182, 0.85);
-  border-color: rgba(244, 114, 182, 1);
-  color: #ffffff;
+/* 計測値（2列の表） */
+.stats {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--glass-border);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  font-size: 12px;
 }
 
-/* 画面右上に薄く小さく表示する解像度・FPSバッジ */
-#info-badge {
+.stats dt {
+  color: var(--text-muted);
+}
+
+.stats dd {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 画面下中央の音色切り替え（セグメント型） */
+#sound-switch {
   position: absolute;
-  top: max(env(safe-area-inset-top), 8px);
-  right: max(env(safe-area-inset-right), 8px);
-  padding: 3px 6px;
-  background-color: rgba(0, 0, 0, 0.45);
-  color: rgba(255, 255, 255, 0.7);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
-  border-radius: 4px;
-  pointer-events: none;
+  bottom: max(env(safe-area-inset-bottom), var(--gutter));
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100vw - var(--gutter) * 2);
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 999px;
+  overflow-x: auto;
+  scrollbar-width: none;
   z-index: 20;
+}
+
+#sound-switch::-webkit-scrollbar {
+  display: none;
+}
+
+#sound-switch button {
+  flex: none;
+  padding: 7px 14px;
+  background: none;
+  color: var(--text-muted);
+  border: none;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+#sound-switch button.active {
+  background-color: var(--accent);
+  color: #ffffff;
 }

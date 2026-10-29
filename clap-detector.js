@@ -12,8 +12,11 @@ export const CLOSE_THRESHOLD = 0.8; // これより近づいたら手が合わ�
 const OPEN_THRESHOLD = 1.6;         // これより離れたら次の拍手を受け付ける（ヒステリシス）
 const COOLDOWN_MS = 120;            // 連続検出を防ぐ最短間隔
 
-// 先読み判定: 勢いよく近づいている場合、次のフレームで合わさると予測できた時点で鳴らし、1フレーム分の遅延を削減
-const PREDICT_MAX_RATIO = 1.5; // この距離より近づいてから先読みを行う
+// 遅延補正（先読み）: カメラ撮影〜推論完了までの遅延の間にも手は動き続けているため、
+// 直近の接近速度から「今この瞬間の実際の距離」を推定し、それで判定する
+export const DEFAULT_LEAD_MS = 60; // 先読みする時間（画面のスライダーで調整可能）
+const PREDICT_MAX_RATIO = 2.5;     // この距離より近づいてから先読みを行う（遠い位置での誤検出防止）
+const SPEED_WINDOW_MS = 80;        // 接近速度の算出に使う直近の時間
 
 // 手が重なって片方（または両方）が見えなくなった場合の判定
 // 素早い拍手では、手が合わさる前のフレームで既に片手が隠れて検出されなくなることが多いため、
@@ -54,6 +57,7 @@ export function getPalm(landmarks) {
 
 export class ClapDetector {
   constructor() {
+    this.leadMs = DEFAULT_LEAD_MS;
     this.reset();
   }
 
@@ -81,7 +85,7 @@ export class ClapDetector {
     if (ratio !== null) {
       if (ratio > OPEN_THRESHOLD) {
         this.isArmed = true;
-      } else if (this.isArmed && (ratio < CLOSE_THRESHOLD || this.willCloseByNextFrame(ratio))) {
+      } else if (this.isArmed && this.predictedRatio(ratio) < CLOSE_THRESHOLD) {
         clap = this.trigger(this.lastMidpoint, timestamp);
       }
     } else if (this.isArmed && this.wasMergingBeforeLoss()) {
@@ -91,15 +95,21 @@ export class ClapDetector {
     return { palms, ratio, isArmed: this.isArmed, clap };
   }
 
-  // 直前フレームからの接近速度が続くと仮定し、次のフレームまでに手が合わさるかを予測
-  willCloseByNextFrame(ratio) {
-    if (ratio > PREDICT_MAX_RATIO || this.history.length < 2) return false;
-    const prev = this.history[this.history.length - 2];
+  // 先読みする時間（ms）を設定
+  setLeadMs(ms) {
+    this.leadMs = ms;
+  }
+
+  // 直近の接近速度が続くと仮定し、leadMs 後（＝今この瞬間の実際の手）の距離を推定
+  predictedRatio(ratio) {
+    if (ratio > PREDICT_MAX_RATIO || this.leadMs <= 0) return ratio;
+
     const last = this.history[this.history.length - 1];
-    const frameMs = last.t - prev.t;
-    if (frameMs <= 0) return false;
-    const closingPerFrame = prev.ratio - last.ratio; // 1フレームで縮まった距離
-    return closingPerFrame > 0 && ratio - closingPerFrame < CLOSE_THRESHOLD;
+    const ref = this.history.find((h) => last.t - h.t <= SPEED_WINDOW_MS);
+    if (!ref || ref === last) return ratio;
+
+    const speedPerMs = (ref.ratio - last.ratio) / (last.t - ref.t); // 正: 近づいている
+    return speedPerMs > 0 ? ratio - speedPerMs * this.leadMs : ratio;
   }
 
   // 両手が見えなくなる直前の履歴から、手が重なって隠れたのかを判定
